@@ -1,275 +1,441 @@
 
 import cv2
 import numpy as np
+import time
 
-# ==========================
-# 1. VIDEO SETUP
-# ==========================
+# ==========================================
+# SETTINGS
+# ==========================================
 
-video = cv2.VideoCapture("C:\\Users\\User\\OneDrive - Kaunas University of Technology\\Desktop\\ImageProcessing\\rocket-tracking\\data\\launch.mp4")
+VIDEO_PATH = "data/launch_day.mp4"
 
-if not video.isOpened():
-    raise FileNotFoundError("Cannot open video")
+WIDTH = 1280
+HEIGHT = 720
 
-THRESHOLD = 150
-MIN_AREA = 50
+START_FRAME = 1200
+MAX_FRAMES = 150
 
-raw_trajectory = []
-kalman_trajectory = []
+GRABCUT_ITERATIONS = 3
+MARGIN = 20
 
-frame_number = 0
+SEARCH_MARGIN = 55
+MIN_MATCH_SCORE = 0.45
 
-# Noise removal kernel
-kernel = cv2.getStructuringElement(
-    cv2.MORPH_ELLIPSE, (3, 3)
-)
+SAVE_FRAME = 1250
+OUTPUT_IMAGE = "rocket_comparison.png"
 
-# ==========================
-# 2. KALMAN FILTER SETUP
-# ==========================
 
-# 4 state variables: x, y, vx, vy
-# 2 measurements: x, y
-kalman = cv2.KalmanFilter(4, 2)
+# ==========================================
+# ROCKET TRACKING
+# ==========================================
 
-# State transition matrix
-# Assume constant velocity between frames
-kalman.transitionMatrix = np.array([
-    [1, 0, 1, 0],
-    [0, 1, 0, 1],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1]
-], dtype=np.float32)
+def track_rocket(frame, template, previous_box):
+    x, y, w, h = previous_box
 
-# Measurement matrix
-kalman.measurementMatrix = np.array([
-    [1, 0, 0, 0],
-    [0, 1, 0, 0]
-], dtype=np.float32)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-# Process noise
-kalman.processNoiseCov = (
-    np.eye(4, dtype=np.float32) * 0.03
-)
+    x1 = max(0, x - SEARCH_MARGIN)
+    y1 = max(0, y - SEARCH_MARGIN)
+    x2 = min(WIDTH, x + w + SEARCH_MARGIN)
+    y2 = min(HEIGHT, y + h + SEARCH_MARGIN)
 
-# Measurement noise
-kalman.measurementNoiseCov = (
-    np.eye(2, dtype=np.float32) * 10
-)
+    search = gray[y1:y2, x1:x2]
 
-kalman.errorCovPost = (
-    np.eye(4, dtype=np.float32)
-)
+    if search.shape[0] < h or search.shape[1] < w:
+        return None, -1.0
 
-kalman_initialized = False
-
-# ==========================
-# 3. PROCESS VIDEO
-# ==========================
-
-while True:
-    success, frame = video.read()
-
-    if not success:
-        break
-
-    frame_number += 1
-
-    frame = cv2.resize(frame, (800, 450))
-    output = frame.copy()
-
-    # Grayscale conversion
-    gray = cv2.cvtColor(
-        frame, cv2.COLOR_BGR2GRAY
+    response = cv2.matchTemplate(
+        search,
+        template,
+        cv2.TM_CCOEFF_NORMED
     )
 
-    # Gaussian smoothing
-    blurred = cv2.GaussianBlur(
-        gray, (5, 5), 0
-    )
+    _, score, _, location = cv2.minMaxLoc(response)
 
-    # Brightness thresholding
-    _, flame_mask = cv2.threshold(
-        blurred,
-        THRESHOLD,
+    return (
+        x1 + location[0],
+        y1 + location[1],
+        w,
+        h
+    ), float(score)
+
+
+# ==========================================
+# GRABCUT SEGMENTATION
+# ==========================================
+
+def segment_rocket(frame, box, modified=False):
+    x, y, w, h = box
+
+    x1 = max(0, x - MARGIN)
+    y1 = max(0, y - MARGIN)
+    x2 = min(WIDTH, x + w + MARGIN)
+    y2 = min(HEIGHT, y + h + MARGIN)
+
+    crop = frame[y1:y2, x1:x2].copy()
+
+    rx = x - x1
+    ry = y - y1
+
+    mask = np.zeros(crop.shape[:2], np.uint8)
+
+    bg_model = np.zeros((1, 65), np.float64)
+    fg_model = np.zeros((1, 65), np.float64)
+
+    if not modified:
+        # Original: rectangle initialization
+        cv2.grabCut(
+            crop,
+            mask,
+            (rx, ry, w, h),
+            bg_model,
+            fg_model,
+            GRABCUT_ITERATIONS,
+            cv2.GC_INIT_WITH_RECT
+        )
+
+    else:
+        # Modified: shape-guided initialization
+        # Background outside the selected rectangle
+        mask[:] = cv2.GC_BGD
+
+        # Everything inside the rectangle starts
+        # as probable foreground, not definite foreground
+        mask[ry:ry+h, rx:rx+w] = cv2.GC_PR_FGD
+
+        center_x = rx + w // 2
+
+        # A narrow tapered seed INSIDE the rocket
+        # We deliberately leave the pointed nose unseeded
+        # so GrabCut can decide its actual boundary.
+
+        top = ry + int(0.22 * h)
+        bottom = ry + int(0.78 * h)
+
+        if bottom > top:
+            seed_points = np.array([
+                [center_x - max(1, int(0.025 * w)), top],
+                [center_x + max(1, int(0.025 * w)), top],
+                [center_x + max(2, int(0.10 * w)), bottom],
+                [center_x - max(2, int(0.10 * w)), bottom]
+            ], dtype=np.int32)
+
+            cv2.fillPoly(
+                mask,
+                [seed_points],
+                cv2.GC_FGD
+            )
+
+        cv2.grabCut(
+            crop,
+            mask,
+            None,
+            bg_model,
+            fg_model,
+            GRABCUT_ITERATIONS,
+            cv2.GC_INIT_WITH_MASK
+        )
+
+    binary = np.where(
+        (mask == cv2.GC_FGD) |
+        (mask == cv2.GC_PR_FGD),
         255,
-        cv2.THRESH_BINARY
+        0
+    ).astype(np.uint8)
+
+    return binary[ry:ry+h, rx:rx+w].copy()
+
+
+# ==========================================
+# VISUALIZATION
+# ==========================================
+
+def overlay_mask(frame, box, mask, color):
+    result = frame.copy()
+    x, y, w, h = box
+
+    roi = result[y:y+h, x:x+w]
+
+    colored = np.zeros_like(roi)
+    colored[:] = color
+
+    blended = cv2.addWeighted(
+        roi, 0.55,
+        colored, 0.45,
+        0
     )
 
-    # Morphological opening
-    flame_mask = cv2.morphologyEx(
-        flame_mask,
-        cv2.MORPH_OPEN,
-        kernel
+    roi[mask > 0] = blended[mask > 0]
+
+    return result
+
+
+def isolated_rocket(frame, box, mask):
+    x, y, w, h = box
+
+    crop = frame[y:y+h, x:x+w]
+    result = np.zeros_like(crop)
+
+    result[mask > 0] = crop[mask > 0]
+
+    return result
+
+
+def make_body_comparison(frame, box, original_mask, modified_mask):
+    original = isolated_rocket(frame, box, original_mask)
+    modified = isolated_rocket(frame, box, modified_mask)
+
+    scale = 4
+
+    original = cv2.resize(
+        original, None,
+        fx=scale, fy=scale,
+        interpolation=cv2.INTER_NEAREST
     )
 
-    # Find contours
-    contours, _ = cv2.findContours(
-        flame_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+    modified = cv2.resize(
+        modified, None,
+        fx=scale, fy=scale,
+        interpolation=cv2.INTER_NEAREST
     )
 
-    measurement = None
+    header = 45
+    h, w = original.shape[:2]
 
-    # ==========================
-    # 4. ORIGINAL DETECTION
-    # ==========================
+    comparison = np.zeros(
+        (h + header, 2 * w, 3),
+        dtype=np.uint8
+    )
 
-    if contours:
-        largest = max(
-            contours,
-            key=cv2.contourArea
-        )
-
-        if cv2.contourArea(largest) > MIN_AREA:
-            x, y, w, h = cv2.boundingRect(largest)
-
-            center_x = x + w // 2
-            top_y = y
-
-            measurement = np.array([
-                [np.float32(center_x)],
-                [np.float32(top_y)]
-            ])
-
-            raw_trajectory.append(
-                (center_x, top_y)
-            )
-
-            # Bounding box
-            cv2.rectangle(
-                output,
-                (x, y),
-                (x + w, y + h),
-                (0, 255, 255),
-                2
-            )
-
-            # Original detected position: RED
-            cv2.circle(
-                output,
-                (center_x, top_y),
-                5,
-                (0, 0, 255),
-                -1
-            )
-
-    # ==========================
-    # 5. KALMAN TRACKING
-    # ==========================
-
-    if measurement is not None:
-        if not kalman_initialized:
-            # Initialize at first detection
-            kalman.statePost = np.array([
-                [measurement[0, 0]],
-                [measurement[1, 0]],
-                [0],
-                [0]
-            ], dtype=np.float32)
-
-            kalman.statePre = kalman.statePost.copy()
-            kalman_initialized = True
-
-    if kalman_initialized:
-
-        # Predict next position
-        prediction = kalman.predict()
-
-        if measurement is not None:
-            # Correct prediction with detection
-            kalman.correct(measurement)
-
-            # Use corrected position
-            state = kalman.statePost
-        else:
-            # No detection: use prediction
-            state = prediction
-
-        kalman_x = int(state[0, 0])
-        kalman_y = int(state[1, 0])
-
-        kalman_trajectory.append(
-            (kalman_x, kalman_y)
-        )
-
-        # Kalman position: GREEN
-        cv2.circle(
-            output,
-            (kalman_x, kalman_y),
-            5,
-            (0, 255, 0),
-            -1
-        )
-
-    # ==========================
-    # 6. DRAW TRAJECTORIES
-    # ==========================
-
-    # Original trajectory: RED
-    for i in range(1, len(raw_trajectory)):
-        cv2.line(
-            output,
-            raw_trajectory[i - 1],
-            raw_trajectory[i],
-            (0, 0, 255),
-            2
-        )
-
-    # Kalman trajectory: GREEN
-    for i in range(1, len(kalman_trajectory)):
-        cv2.line(
-            output,
-            kalman_trajectory[i - 1],
-            kalman_trajectory[i],
-            (0, 255, 0),
-            2
-        )
-
-    # ==========================
-    # 7. DISPLAY INFORMATION
-    # ==========================
+    comparison[header:, :w] = original
+    comparison[header:, w:] = modified
 
     cv2.putText(
-        output,
-        f"Frame: {frame_number}",
+        comparison,
+        "Original GrabCut",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
+        0.65,
         (255, 255, 255),
         2
     )
 
     cv2.putText(
-        output,
-        "Red: Original",
-        (10, 60),
+        comparison,
+        "Tapered GrabCut",
+        (w + 10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 0, 255),
+        0.65,
+        (255, 255, 255),
+        2
+    )
+
+    return comparison
+
+
+# ==========================================
+# VIDEO SETUP
+# ==========================================
+
+video = cv2.VideoCapture(VIDEO_PATH)
+
+if not video.isOpened():
+    raise FileNotFoundError(VIDEO_PATH)
+
+video.set(cv2.CAP_PROP_POS_FRAMES, START_FRAME)
+
+success, first_frame = video.read()
+
+if not success:
+    video.release()
+    raise RuntimeError("Cannot read starting frame")
+
+first_frame = cv2.resize(first_frame, (WIDTH, HEIGHT))
+
+print("Select ONLY the rocket body.")
+print("Include the nose but exclude flame and smoke.")
+print("Press ENTER to confirm.")
+
+selection = cv2.selectROI(
+    "Select Rocket",
+    first_frame,
+    fromCenter=False,
+    showCrosshair=True
+)
+
+cv2.destroyWindow("Select Rocket")
+
+x, y, w, h = map(int, selection)
+
+if w <= 2 or h <= 2:
+    video.release()
+    raise RuntimeError("Invalid ROI")
+
+template = cv2.cvtColor(
+    first_frame,
+    cv2.COLOR_BGR2GRAY
+)[y:y+h, x:x+w].copy()
+
+previous_box = (x, y, w, h)
+
+video.set(cv2.CAP_PROP_POS_FRAMES, START_FRAME)
+
+original_times = []
+modified_times = []
+
+frame_count = 0
+
+
+# ==========================================
+# PROCESS VIDEO
+# ==========================================
+
+while frame_count < MAX_FRAMES:
+    success, frame = video.read()
+
+    if not success:
+        break
+
+    frame = cv2.resize(frame, (WIDTH, HEIGHT))
+    frame_number = START_FRAME + frame_count
+
+    if frame_count == 0:
+        box = previous_box
+        score = 1.0
+    else:
+        box, score = track_rocket(
+            frame,
+            template,
+            previous_box
+        )
+
+    if box is None or score < MIN_MATCH_SCORE:
+        print(f"Frame {frame_number}: tracking lost")
+        frame_count += 1
+        continue
+
+    # Original GrabCut
+    start = time.perf_counter()
+
+    original_mask = segment_rocket(
+        frame,
+        box,
+        modified=False
+    )
+
+    original_time = (
+        time.perf_counter() - start
+    ) * 1000
+
+    # Modified GrabCut
+    start = time.perf_counter()
+
+    modified_mask = segment_rocket(
+        frame,
+        box,
+        modified=True
+    )
+
+    modified_time = (
+        time.perf_counter() - start
+    ) * 1000
+
+    original_times.append(original_time)
+    modified_times.append(modified_time)
+
+    previous_box = box
+
+    # Colored segmentation comparison
+    original_overlay = overlay_mask(
+        frame, box, original_mask, (0, 0, 255)
+    )
+
+    modified_overlay = overlay_mask(
+        frame, box, modified_mask, (0, 255, 0)
+    )
+
+    comparison = np.hstack(
+        (original_overlay, modified_overlay)
+    )
+
+    comparison = cv2.resize(
+        comparison,
+        (1280, 360)
+    )
+
+    cv2.putText(
+        comparison,
+        "Original GrabCut",
+        (15, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (255, 255, 255),
         2
     )
 
     cv2.putText(
-        output,
-        "Green: Kalman",
-        (10, 85),
+        comparison,
+        "Tapered GrabCut",
+        (655, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 255, 0),
+        0.75,
+        (255, 255, 255),
         2
     )
 
-    cv2.imshow("Rocket Tracking Comparison", output)
-    cv2.imshow("Flame Mask", flame_mask)
+    body_comparison = make_body_comparison(
+        frame,
+        box,
+        original_mask,
+        modified_mask
+    )
+
+    cv2.imshow(
+        "Rocket Segmentation Comparison",
+        comparison
+    )
+
+    cv2.imshow(
+        "Isolated Rocket Bodies",
+        body_comparison
+    )
+
+    if frame_number == SAVE_FRAME:
+        cv2.imwrite(OUTPUT_IMAGE, body_comparison)
+        print(f"Saved {OUTPUT_IMAGE}")
+
+    print(
+        f"Frame {frame_number} "
+        f"| NCC: {score:.3f} "
+        f"| Original: {original_time:.1f} ms "
+        f"| Modified: {modified_time:.1f} ms"
+    )
+
+    frame_count += 1
 
     if cv2.waitKey(30) & 0xFF == ord("q"):
         break
 
+
+# ==========================================
+# RESULTS
+# ==========================================
+
 video.release()
 cv2.destroyAllWindows()
 
-print("Tracking completed!")
-print("Original detections:", len(raw_trajectory))
-print("Kalman positions:", len(kalman_trajectory))
+print("\n===== EXPERIMENT RESULTS =====")
+print("Processed frames:", len(original_times))
+
+if original_times:
+    print(
+        "Average original time:",
+        round(np.mean(original_times), 2),
+        "ms"
+    )
+
+    print(
+        "Average modified time:",
+        round(np.mean(modified_times), 2),
+        "ms"
+    )
